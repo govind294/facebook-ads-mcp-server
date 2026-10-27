@@ -7,6 +7,31 @@ This project provides an MCP server acting as an interface to the Meta Ads, enab
 
 <video controls width="1920" height="512" src="https://github.com/user-attachments/assets/c4a76dcf-cf5d-4a1d-b976-08165e880fe4">Your browser does not support the video tag.</video>
 
+## Read-only hardening in this fork
+
+This fork keeps the tools read-only. Account listing exhausts its nested account
+pages and returns local `_collection` coverage metadata. `max_pages=100` is an
+explicit engineering bound; a remaining page, cycle, malformed page or conflicting
+account ID raises instead of returning a partial inventory as complete. Other
+individual collection tools still return one page and require their own complete
+collector loop.
+
+All GETs validate HTTPS `graph.facebook.com`, disable redirects, use a 30-second
+request timeout, and omit raw URLs, tokens and response bodies from exceptions.
+`FB_ACCESS_TOKEN` from the process environment is preferred; legacy `--fb-token`
+remains supported. Packaged launch examples pass the token through the environment,
+not argv. Keep real credentials out of repository files.
+
+Run the synthetic regressions without installing MCP or requests:
+
+```sh
+python -m unittest -v test_readonly_hardening
+```
+
+These tests use fake transport/MCP modules and synthetic values. They do not prove
+live API compatibility, campaign performance, first-ever payer attribution or ROAS.
+No marketing thresholds or spending authority are introduced.
+
 ## Easy One-Click Setup
 
 For a simpler setup experience, we offer ready-to-use installers:
@@ -61,25 +86,14 @@ GoMarble **does not store** your token — it is saved locally on your machine f
 
 ### Usage with MCP Clients (e.g., Cursor, Claude Desktop)
 
-To integrate this server with an MCP-compatible client, add a configuration([Claude](https://modelcontextprotocol.io/quickstart/user#2-add-the-filesystem-mcp-server)) similar to the following. Replace `YOUR_META_ACCESS_TOKEN` with your actual token and adjust the path to `server.py` if necessary.
+To integrate this server with an MCP-compatible client, add a configuration([Claude](https://modelcontextprotocol.io/quickstart/user#2-add-the-filesystem-mcp-server)) similar to the following. Arrange for the server process to inherit `FB_ACCESS_TOKEN` from your approved local secret mechanism and adjust the path to `server.py`. Do not commit the token or put it in process arguments.
 
 ```json
 {
   "mcpServers": {
     "fb-ads-mcp-server": {
       "command": "python",
-      "args": [
-        "/path/to/your/fb-ads-mcp-server/server.py",
-        "--fb-token",
-        "YOUR_META_ACCESS_TOKEN"
-      ]
-      // If using a virtual environment, you might need to specify the python executable within the venv:
-      // "command": "/path/to/your/fb-ads-mcp-server/venv/bin/python",
-      // "args": [
-      //   "/path/to/your/fb-ads-mcp-server/server.py",
-      //   "--fb-token",
-      //   "YOUR_META_ACCESS_TOKEN"
-      // ]
+      "args": ["/path/to/your/fb-ads-mcp-server/server.py"]
     }
   }
 }
@@ -90,10 +104,10 @@ Restart the MCP Client app after making the update in the configuration.
 
 ### Debugging the Server
 
-Execute `server.py`, providing the access token via the `--fb-token` argument.
+Execute `server.py` with `FB_ACCESS_TOKEN` already supplied through the process environment.
 
 ```bash
-python server.py --fb-token YOUR_META_ACCESS_TOKEN
+python server.py
 ```
 
 ### Available MCP Tools

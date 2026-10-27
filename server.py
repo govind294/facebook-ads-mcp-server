@@ -5,7 +5,8 @@ from typing import Dict, List, Optional, Any
 import json
 import requests
 import sys
-from urllib.parse import urlsplit
+import os
+from urllib.parse import urlsplit, parse_qs
 
     
 
@@ -28,55 +29,67 @@ FB_ACCESS_TOKEN = None
 # --- Helper Functions ---
 
 def _get_fb_access_token() -> str:
-    """
-    Get Facebook access token from command line arguments.
-    Caches the token in memory after first read.
+    """Read FB_ACCESS_TOKEN from the environment, with legacy argv fallback.
 
-    Returns:
-        str: The Facebook access token.
-
-    Raises:
-        Exception: If no token is provided in command line arguments.
+    Cache in memory after first read; never print credentials or their source.
     """
     global FB_ACCESS_TOKEN
     if FB_ACCESS_TOKEN is None:
-        # Look for --fb-token argument
-        if "--fb-token" in sys.argv:
+        environment_token = os.environ.get("FB_ACCESS_TOKEN", "").strip()
+        if environment_token:
+            FB_ACCESS_TOKEN = environment_token
+        elif "--fb-token" in sys.argv:
             token_index = sys.argv.index("--fb-token") + 1
-            if token_index < len(sys.argv):
-                FB_ACCESS_TOKEN = sys.argv[token_index]
-                print(f"Using Facebook token from command line arguments")
-            else:
-                raise Exception("--fb-token argument provided but no token value followed it")
+            if token_index >= len(sys.argv) or not sys.argv[token_index].strip() or sys.argv[token_index].startswith("--"):
+                raise ValueError("--fb-token requires a nonempty token value")
+            FB_ACCESS_TOKEN = sys.argv[token_index]
         else:
-            raise Exception("Facebook token must be provided via '--fb-token' command line argument")
-
+            raise ValueError("Set FB_ACCESS_TOKEN; legacy --fb-token is also supported")
     return FB_ACCESS_TOKEN
 
+
 def _redact_token(text: str, token: Optional[str]) -> str:
-    """Strip a secret value out of a string before it's logged or surfaced to a caller."""
-    if token:
-        text = text.replace(token, "***REDACTED***")
-    return text
+    """Strip a supplied secret value from diagnostic text."""
+    return text.replace(token, "***REDACTED***") if token else text
+
+
+def _validate_graph_url(url: str):
+    """Validate before a request; do not include unsafe input in exceptions."""
+    if not isinstance(url, str) or not url or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in url):
+        raise ValueError("Graph URL must be a nonempty URL without control characters")
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("Invalid Facebook Graph API URL") from None
+    if (parsed.scheme.lower() != "https" or parsed.hostname != "graph.facebook.com"
+            or port not in (None, 443) or parsed.username is not None
+            or parsed.password is not None or parsed.fragment):
+        raise ValueError("Graph URL must use HTTPS and target graph.facebook.com without user info or fragments")
+    return parsed
 
 
 def _make_graph_api_call(url: str, params: Dict[str, Any]) -> Dict:
-    """Makes a GET request to the Facebook Graph API and handles the response."""
-    token = params.get('access_token')
+    """Bounded GET only, with no redirects or credential-bearing diagnostics."""
+    _validate_graph_url(url)
+    response = None
     try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        # Never log/raise the raw params or exception: both the params dict and
-        # requests' own HTTPError message (which embeds the full request URL,
-        # access_token included, via response.url) can leak the token to local
-        # logs and to whatever surfaces the exception message upstream (e.g. an
-        # MCP client). Redact before doing either.
-        safe_params = {k: ('***REDACTED***' if k == 'access_token' else v) for k, v in params.items()}
-        safe_message = _redact_token(str(e), token)
-        print(f"Error making Graph API call to {url} with params {safe_params}: {safe_message}")
-        raise requests.exceptions.RequestException(safe_message) from None
+        response = requests.get(url, params=params, allow_redirects=False, timeout=30)
+        if 300 <= response.status_code < 400:
+            raise requests.exceptions.RequestException("Redirect rejected")
+        response.raise_for_status()
+        result = response.json()
+    except requests.exceptions.RequestException:
+        # HTTPError, URL, params, response body and chained exception can all
+        # contain tokens (including percent-encoded URL tokens). Do not emit them.
+        status = getattr(response, "status_code", None)
+        suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+        raise requests.exceptions.RequestException("Facebook Graph API request failed" + suffix) from None
+    except ValueError:
+        raise ValueError("Facebook Graph API returned invalid JSON") from None
+    if not isinstance(result, dict) or result.get("error"):
+        raise ValueError("Facebook Graph API returned an invalid response or API error")
+    return result
 
 
 def _prepare_params(base_params: Dict[str, Any], **kwargs) -> Dict[str, Any]:
@@ -211,23 +224,59 @@ def _build_insights_params(
 
 # --- MCP Tools ---
 @mcp.tool()
-def list_ad_accounts() -> Dict:
-    """List down the ad accounts and their names associated with your Facebook account.
-        CRITICAL: This function MUST automatically fetch ALL pages using pagination. 
-        When the response contains a 'paging.next' URL, IMMEDIATELY and AUTOMATICALLY 
-        use the facebook_fetch_pagination_url tool to fetch the next page. Continue 
-        this process until no 'next' URL exists. Do NOT ask the user for permission 
-        to continue pagination. Do NOT stop after the first page. Always return the 
-        complete consolidated list of ALL ad accounts across all pages in a single 
-        response. This is a requirement, not optional behavior."""
-    # This uses a specific endpoint structure not fitting _fetch_node/_fetch_edge easily
-    access_token = _get_fb_access_token()
-    url = f"{FB_GRAPH_URL}/me"
-    params = {
-        'access_token': access_token,
-        'fields': 'adaccounts{name}' # Specific field structure
-    }
-    return _make_graph_api_call(url, params)
+def list_ad_accounts(max_pages: int = 100) -> Dict:
+    """Return all account pages, or raise rather than report a partial inventory.
+
+    max_pages is an explicit safety bound including the initial page. Identical
+    duplicate IDs are deduplicated; conflicting rows and repeated cursors fail.
+    The original /me response structure is preserved and local coverage metadata
+    is added under _collection. No pagination URLs or tokens are retained.
+    """
+    if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
+        raise ValueError("max_pages must be a positive integer")
+    initial = _make_graph_api_call(f"{FB_GRAPH_URL}/me", {
+        "access_token": _get_fb_access_token(), "fields": "adaccounts{name}"})
+    edge = initial.get("adaccounts")
+    rows, seen_ids, seen_urls, seen_cursors = [], {}, set(), set()
+    pages = 0
+    while True:
+        pages += 1
+        if not isinstance(edge, dict) or not isinstance(edge.get("data"), list):
+            raise ValueError("Malformed account page; complete inventory unavailable")
+        for row in edge["data"]:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"].strip():
+                raise ValueError("Malformed account row; complete inventory unavailable")
+            identity = row["id"]
+            if identity in seen_ids:
+                if seen_ids[identity] != row:
+                    raise ValueError("Conflicting account rows across pages; complete inventory unavailable")
+            else:
+                seen_ids[identity] = row
+                rows.append(row)
+        paging = edge.get("paging", {})
+        if not isinstance(paging, dict):
+            raise ValueError("Malformed pagination metadata; complete inventory unavailable")
+        next_url = paging.get("next")
+        if not next_url:
+            break
+        parsed = _validate_graph_url(next_url)
+        cursor_values = parse_qs(parsed.query).get("after", [])
+        if len(cursor_values) > 1:
+            raise ValueError("Ambiguous pagination cursor; complete inventory unavailable")
+        cursor = cursor_values[0] if cursor_values else None
+        if next_url in seen_urls or (cursor is not None and cursor in seen_cursors):
+            raise ValueError("Repeated pagination URL or cursor; complete inventory unavailable")
+        if pages >= max_pages:
+            raise ValueError("max_pages reached with a next page remaining; complete inventory unavailable")
+        seen_urls.add(next_url)
+        if cursor is not None:
+            seen_cursors.add(cursor)
+        edge = fetch_pagination_url(next_url)
+    output = dict(initial)
+    output["adaccounts"] = {key: value for key, value in initial["adaccounts"].items() if key not in {"data", "paging"}}
+    output["adaccounts"]["data"] = rows
+    output["_collection"] = {"pagination_complete": True, "pages_fetched": pages, "unique_accounts": len(rows)}
+    return output
 
 
 @mcp.tool()
@@ -804,52 +853,12 @@ def get_ad_insights(
 
 @mcp.tool()
 def fetch_pagination_url(url: str) -> Dict:
-    """Fetch data from a Facebook Graph API pagination URL
-    
-    Use this to get the next/previous page of results from an insights API call.
-    
-    Args:
-        url: The complete pagination URL (e.g., from response['paging']['next'] or response['paging']['previous']).
-             It includes the necessary token and parameters.
-             
-    Returns:
-        The dictionary containing the next/previous page of results.
-        
-    Example:
-        ```python
-        # Assuming 'initial_results' is the dict from a previous insights call
-        if "paging" in initial_results and "next" in initial_results["paging"]:
-            next_page_data = fetch_pagination_url(url=initial_results["paging"]["next"])
+    """Read one validated Graph pagination URL with bounded, redacted GET.
 
-        if "paging" in initial_results and "previous" in initial_results["paging"]:
-            prev_page_data = fetch_pagination_url(url=initial_results["paging"]["previous"])
-        ```
+    This individual tool returns one page. list_ad_accounts performs its own
+    complete loop; other callers must explicitly exhaust their own page chain.
     """
-    # This function takes a full URL which already includes the access token,
-    # so we don't use the _make_graph_api_call helper here.
-    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in url):
-        raise ValueError("Pagination URL must not contain spaces or control characters")
-
-    try:
-        parsed_url = urlsplit(url)
-        port = parsed_url.port
-    except ValueError as exc:
-        raise ValueError("Invalid Facebook Graph API pagination URL") from exc
-
-    if (
-        parsed_url.scheme.lower() != "https"
-        or parsed_url.hostname != "graph.facebook.com"
-        or port not in (None, 443)
-        or parsed_url.username is not None
-        or parsed_url.password is not None
-    ):
-        raise ValueError(
-            "Pagination URL must use HTTPS and target graph.facebook.com"
-        )
-
-    response = requests.get(url, allow_redirects=False, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    return _make_graph_api_call(url, {})
 
 
 # --- Ad Creative Tools ---
